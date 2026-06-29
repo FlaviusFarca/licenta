@@ -1,0 +1,5 @@
+streamlit>=1.35.0
+torch>=2.0.0
+transformers>=4.40.0
+scikit-learn
+pandas
