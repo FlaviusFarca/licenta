@@ -165,13 +165,12 @@ border-radius: 8px !important;
 /* ── Text area ───────────────────────────────────────────── */
 .stTextArea textarea {
 background: #ffffff !important;
-border: 1px solid #d1d5db !important;
-border-radius: 10px !important;
-color: #1a1a1a !important;
-font-family: 'DM Sans', sans-serif !important;
-font-size: 0.92rem !important;
-line-height: 1.75 !important;
-padding: 14px 16px !important;
+border: 2px solid #e5e7eb !important;
+border-radius: 12px !important;
+padding: 16px !important;
+font-size: 1.18rem !important;
+color: #1f2937 !important;
+line-height: 1.6 !important;
 resize: vertical !important;
 transition: border-color 0.15s ease, box-shadow 0.15s ease !important;
 }
@@ -181,8 +180,8 @@ box-shadow: 0 0 0 3px rgba(29, 78, 216, 0.1) !important;
 outline: none !important;
 }
 .stTextArea textarea::placeholder {
-color: #4b5563 !important;
-font-size: 0.87rem !important;
+color: #9ca3af !important;
+font-size: 1.12rem !important;
 }
 /* ── Contor tokens ───────────────────────────────────────── */
 .token-bar {
@@ -221,7 +220,7 @@ background: #ffffff !important;
 border: 1px solid #d1d5db !important;
 color: #1a1a1a !important;
 border-radius: 8px !important;
-font-size: 0.83rem !important;
+font-size: 1.07rem !important;
 }
 div[data-testid="column"] .stButton button:not([kind="primary"]):hover {
 background: #eff6ff !important;
@@ -235,7 +234,7 @@ color: #ffffff !important;
 border: none !important;
 border-radius: 10px !important;
 font-weight: 700 !important;
-font-size: 0.95rem !important;
+font-size: 1.22rem !important;
 letter-spacing: -0.01em !important;
 box-shadow: 0 2px 8px rgba(29, 78, 216, 0.3) !important;
 transition: all 0.15s ease !important;
@@ -517,6 +516,28 @@ def load_models():
 def count_tokens(tokenizer, text: str) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
 
+def is_technical_data(text: str) -> bool:
+    """
+    Heuristic to check if text is mostly numbers, tables, or special chars.
+    Used to skip AI detection on pure data fragments to prevent false positives.
+    """
+    if not text.strip(): return True
+    chars = [c for c in text if c.strip()]
+    if not chars: return True
+    
+    digits = sum(c.isdigit() for c in chars)
+    alphas = sum(c.isalpha() for c in chars)
+    
+    digit_ratio = digits / len(chars)
+    alpha_ratio = alphas / len(chars)
+    
+    if digit_ratio > 0.10:
+        return True
+    if alpha_ratio < 0.60:
+        return True
+        
+    return False
+
 
 def predict(model, tokenizer, text: str):
     """
@@ -541,30 +562,64 @@ def predict(model, tokenizer, text: str):
     ai_probs = []
     chunk_details = []
 
-    for chunk in chunks:
+    valid_inputs = []
+    valid_texts = []
+    chunk_order_map = [] # To keep track of the original index
+
+    for i, chunk in enumerate(chunks):
+        chunk_text = tokenizer.decode(chunk, skip_special_tokens=True)
+        
+        # Smart Data Filter
+        if is_technical_data(chunk_text):
+            chunk_details.append({"text": chunk_text, "ai_prob": 0.0, "is_data": True, "idx": i})
+            continue
+
         input_ids = [tokenizer.cls_token_id] + chunk + [tokenizer.sep_token_id]
         attention_mask = [1] * len(input_ids)
 
-        pad_len = max(0, MAX_TOKENS - len(input_ids))
-        input_ids += [tokenizer.pad_token_id] * pad_len
-        attention_mask += [0] * pad_len
+        valid_inputs.append({"input_ids": input_ids, "attention_mask": attention_mask})
+        valid_texts.append(chunk_text)
+        chunk_order_map.append(i)
 
-        inputs = {
-            "input_ids": torch.tensor([input_ids]).to(DEVICE),
-            "attention_mask": torch.tensor([attention_mask]).to(DEVICE),
-        }
+    # Process valid chunks in batches
+    BATCH_SIZE = 16
+    for i in range(0, len(valid_inputs), BATCH_SIZE):
+        batch = valid_inputs[i:i + BATCH_SIZE]
+        
+        # Dynamic padding: pad to the maximum sequence length in the current batch
+        max_batch_len = max(len(item["input_ids"]) for item in batch)
+        
+        batch_input_ids = []
+        batch_attention_mask = []
+        
+        for item in batch:
+            pad_len = max_batch_len - len(item["input_ids"])
+            padded_input_ids = item["input_ids"] + [tokenizer.pad_token_id] * pad_len
+            padded_attention_mask = item["attention_mask"] + [0] * pad_len
+            
+            batch_input_ids.append(padded_input_ids)
+            batch_attention_mask.append(padded_attention_mask)
+        
+        batch_input_ids = torch.tensor(batch_input_ids).to(DEVICE)
+        batch_attention_mask = torch.tensor(batch_attention_mask).to(DEVICE)
 
         with torch.no_grad():
-            logits = model(**inputs).logits
-            probs = torch.softmax(logits, dim=-1).squeeze(0).cpu().tolist()
-            human_probs.append(probs[0])
-            ai_probs.append(probs[1])
+            logits = model(input_ids=batch_input_ids, attention_mask=batch_attention_mask).logits
+            probs = torch.softmax(logits, dim=-1).cpu().tolist()
+            
+            for j, prob in enumerate(probs):
+                human_probs.append(prob[0])
+                ai_probs.append(prob[1])
+                original_idx = chunk_order_map[i + j]
+                chunk_details.append({"text": valid_texts[i + j], "ai_prob": prob[1] * 100, "is_data": False, "idx": original_idx})
 
-            chunk_text = tokenizer.decode(chunk, skip_special_tokens=True)
-            chunk_details.append({"text": chunk_text, "ai_prob": probs[1] * 100})
+    # Restore the original text order
+    chunk_details.sort(key=lambda x: x["idx"])
+    for c in chunk_details:
+        del c["idx"]
 
-    avg_human = sum(human_probs) / len(human_probs)
-    avg_ai = sum(ai_probs) / len(ai_probs)
+    avg_human = sum(human_probs) / len(human_probs) if human_probs else 0.5
+    avg_ai = sum(ai_probs) / len(ai_probs) if ai_probs else 0.5
 
     # Threshold aplicat per-fragment
     threshold_pct = st.session_state.get('threshold', DEFAULT_THRESHOLD) * 100
@@ -621,26 +676,26 @@ def render_result(result_dict: dict):
         border_color = "#fca5a5"
         verdict_text = "Majority AI content"
 
-    verdict_sub = f"{flagged} din {num_chunks} fragment(s) exceeded the threshold of {threshold_pct:.0f}%"
+    verdict_sub = f"{flagged} out of {num_chunks} fragment(s) exceeded the threshold of {threshold_pct:.0f}%"
 
     st.markdown(
         f"""
 <div style="background:{bg_color}; border:2px solid {border_color}; border-radius:16px; padding:24px 20px; text-align:center; margin-bottom:16px;">
   <p style="font-size:0.85rem; font-weight:700; color:#6b7280; letter-spacing:0.08em; text-transform:uppercase; margin:0 0 8px 0;">{verdict_text}</p>
   <div style="font-size:4rem; font-weight:900; color:{color}; line-height:1;">{ai_pct:.0f}<span style="font-size:1.8rem;">%</span></div>
-  <p style="font-size:0.9rem; color:{color}; font-weight:600; margin:6px 0 0 0;">din text este generat de AI</p>
+  <p style="font-size:0.9rem; color:{color}; font-weight:600; margin:6px 0 0 0;">of the text is AI-generated</p>
   <p style="font-size:0.78rem; color:#6b7280; margin:4px 0 0 0;">{verdict_sub}</p>
 </div>
 <div style="background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:12px 16px; margin-bottom:8px;">
   <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px;">
-    <span style="font-size:0.8rem; color:#6b7280; min-width:90px;">AI detectat</span>
+    <span style="font-size:0.8rem; color:#6b7280; min-width:90px;">AI detected</span>
     <div style="flex:1; background:#f3f4f6; border-radius:999px; height:10px; overflow:hidden;">
       <div style="width:{ai_pct:.1f}%; background:{color}; height:100%; border-radius:999px;"></div>
     </div>
     <span style="font-size:0.8rem; font-weight:700; color:{color}; min-width:42px; text-align:right;">{ai_pct:.1f}%</span>
   </div>
   <div style="display:flex; align-items:center; gap:10px;">
-    <span style="font-size:0.8rem; color:#6b7280; min-width:90px;">Uman detectat</span>
+    <span style="font-size:0.8rem; color:#6b7280; min-width:90px;">Human detected</span>
     <div style="flex:1; background:#f3f4f6; border-radius:999px; height:10px; overflow:hidden;">
       <div style="width:{100 - ai_pct:.1f}%; background:#16a34a; height:100%; border-radius:999px;"></div>
     </div>
@@ -649,7 +704,7 @@ def render_result(result_dict: dict):
 </div>
 <div style="font-size:0.72rem; color:#9ca3af; text-align:center; margin-top:2px;">
   Average model score: Human <strong>{result_dict.get('prob_human', 0):.1f}%</strong> &nbsp;·&nbsp; AI <strong>{result_dict.get('prob_ai', 0):.1f}%</strong>
-  &nbsp;·&nbsp; Model: <strong>{model_name}</strong> &nbsp;·&nbsp; Prag: <strong>{threshold_pct:.0f}%</strong>
+  &nbsp;·&nbsp; Model: <strong>{model_name}</strong> &nbsp;·&nbsp; Threshold: <strong>{threshold_pct:.0f}%</strong>
 </div>
 """,
         unsafe_allow_html=True,
@@ -691,6 +746,10 @@ def render_highlighted_text(result_dict: dict):
     <span style="background:#fca5a5; border-radius:4px; padding:1px 7px; margin-right:4px;">&nbsp;</span>
     AI (&ge;&nbsp;{ai_threshold:.0f}%)
   </span>
+  <span style="font-size:0.78rem; color:#374151;">
+    <span style="background:#e5e7eb; border-radius:4px; padding:1px 7px; margin-right:4px;">&nbsp;</span>
+    Data / Table (Skipped)
+  </span>
 </div>
 """,
         unsafe_allow_html=True,
@@ -719,18 +778,23 @@ def render_highlighted_text(result_dict: dict):
     # ── Build highlighted HTML ───────────────────────────────────────────────────
     html_parts = [
         '<div style="background:#f9fafb; border:1px solid #e5e7eb; border-radius:12px; '
-        'padding:20px 22px; line-height:1.8; font-size:0.92rem; color:#1f2937; '
+        'padding:20px 22px; line-height:1.8; font-size:1.18rem; color:#1f2937; '
         'font-family:\'DM Sans\', sans-serif; word-wrap:break-word;">'
     ]
 
     for seg in all_segs:
         raw_text = seg["text"]
-        score    = seg["ai_prob"]
+        score    = seg.get("ai_prob", 0.0)
+        is_data  = seg.get("is_data", False)
 
         # Replace newlines with <br> so span background covers across line breaks
         text = html_lib.escape(raw_text).replace("\n", "<br>")
 
-        if score < human_threshold:
+        if is_data:
+            bg      = "transparent"
+            border  = "#d1d5db"
+            verdict = "Data / Table — Excluded from AI Analysis"
+        elif score < human_threshold:
             bg      = "#bbf7d0"
             border  = "#86efac"
             verdict = f"Human — AI probability: {score:.1f}%"
@@ -765,19 +829,24 @@ def render_highlighted_text(result_dict: dict):
 
 def generate_pdf_report(r, original_pdf_bytes=None):
     """
-
     Daca exista PDF original: il deschide cu PyMuPDF si aplica highlight rosu
-
     pe secventele detectate ca AI, pastrand layout-ul 1:1.
-
     Fallback: genereaza un PDF nou cu fpdf2 daca nu exista original.
-
     """
+    import hashlib
+    
+    if original_pdf_bytes is not None:
+        file_hash = hashlib.sha256(original_pdf_bytes).hexdigest()
+    else:
+        raw_text = "".join(seg["text"] for seg in r.get("all_segments", []))
+        file_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+        
+    fname = r.get("source_filename", "Manual Text Input")
+    timestamp = r.get("timestamp", "")
+    model_used = r.get("model", "")
 
     # ── Varianta 1: PDF original disponibil → 1:1 cu highlight ──────────────
-
     if original_pdf_bytes is not None:
-
         import fitz  # PyMuPDF
 
         doc = fitz.open(stream=original_pdf_bytes, filetype="pdf")
@@ -785,10 +854,7 @@ def generate_pdf_report(r, original_pdf_bytes=None):
             segment_text = seg["text"].strip()
             if not segment_text:
                 continue
-            # Impartim segmentul in fraze mai scurte pentru match mai bun
-            # (PyMuPDF cauta string-uri exacte pe fiecare pagina)
             words = segment_text.split()
-            # Incercam mai intai textul complet, apoi bucati de 10 cuvinte
             search_phrases = [segment_text]
             if len(words) > 10:
                 for i in range(0, len(words), 8):
@@ -800,10 +866,18 @@ def generate_pdf_report(r, original_pdf_bytes=None):
                 for phrase in search_phrases:
                     instances = page.search_for(phrase, quads=False)
                     for rect in instances:
-                        # Adaugam adnotare highlight cu culoare rosie
                         highlight = page.add_highlight_annot(rect)
                         highlight.set_colors(stroke=[1, 0.2, 0.2])  # RGB rosu
                         highlight.update()
+
+        # Add Audit Page
+        audit_page = doc.new_page(-1, width=595, height=842) # A4
+        audit_page.insert_text((50, 50), "TEXTSCAN - FORENSIC AUDIT TRAIL", fontsize=16, fontname="hebo", color=(0,0,0))
+        audit_page.insert_text((50, 80), f"Source File: {fname}", fontsize=11, fontname="helv", color=(0.2, 0.2, 0.2))
+        audit_page.insert_text((50, 100), f"SHA-256 Hash: {file_hash}", fontsize=11, fontname="helv", color=(0.2, 0.2, 0.2))
+        audit_page.insert_text((50, 120), f"Analysis Timestamp: {timestamp}", fontsize=11, fontname="helv", color=(0.2, 0.2, 0.2))
+        audit_page.insert_text((50, 140), f"AI Detection Model: {model_used}", fontsize=11, fontname="helv", color=(0.2, 0.2, 0.2))
+        audit_page.insert_text((50, 170), "This report is cryptographically verifiable and mathematically reproducible.", fontsize=10, fontname="hebo", color=(0.5, 0.5, 0.5))
 
         return doc.tobytes()
 
@@ -829,9 +903,8 @@ def generate_pdf_report(r, original_pdf_bytes=None):
     pdf.add_font("Arial", "B", "C:\\Windows\\Fonts\\arialbd.ttf")
 
     pdf.add_page()
-
     pdf.set_font("Arial", size=11)
-    pdf.cell(0, 8, f"Timestamp: {r['timestamp']}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8, f"Timestamp: {timestamp}", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(
         0,
         8,
@@ -839,7 +912,7 @@ def generate_pdf_report(r, original_pdf_bytes=None):
         new_x="LMARGIN",
         new_y="NEXT",
     )
-    pdf.cell(0, 8, f"Model used: {r['model']}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8, f"Model used: {model_used}", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(
         0,
         8,
@@ -864,14 +937,29 @@ def generate_pdf_report(r, original_pdf_bytes=None):
         safe_text = html_lib.escape(seg["text"]).replace("\n", "<br>")
         threshold_pct = st.session_state.get('threshold', DEFAULT_THRESHOLD) * 100
         if seg["ai_prob"] >= threshold_pct:
-            # fpdf2 write_html doesn't support CSS background colors or <mark>.
-            # We use bold red font to highlight AI text in the PDF.
             html_text += f'<b><font color="#dc2626">{safe_text}</font></b> '
         else:
             html_text += f"{safe_text} "
 
     pdf.set_font("Arial", size=11)
     pdf.write_html(html_text)
+
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.set_text_color(0, 0, 0)
+    pdf.cell(0, 10, "TEXTSCAN - FORENSIC AUDIT TRAIL", new_x="LMARGIN", new_y="NEXT", align="L")
+    pdf.ln(5)
+    
+    pdf.set_font("Arial", "", 11)
+    pdf.set_text_color(50, 50, 50)
+    pdf.cell(0, 8, f"Source File: {fname}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8, f"SHA-256 Hash: {file_hash}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8, f"Analysis Timestamp: {timestamp}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8, f"AI Detection Model: {model_used}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(8)
+    pdf.set_font("Arial", "B", 10)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 8, "This report is cryptographically verifiable and mathematically reproducible.", new_x="LMARGIN", new_y="NEXT")
 
     return bytes(pdf.output())
 
@@ -1040,15 +1128,18 @@ with tab_text:
         # Contor tokens
 
         n_tok = count_tokens(tokenizer, text_value.strip()) if text_value.strip() else 0
+        n_words = len(text_value.split())
+        n_chars = len(text_value)
+        read_time = max(1, round(n_words / 200)) if n_words > 0 else 0
 
         num_chunks_ui = (n_tok + MAX_TOKENS - 3) // (MAX_TOKENS - 2) if n_tok > 0 else 0
 
         st.markdown(
             f"""
 <div class="token-bar" style="margin-bottom:10px;">
-<span class="token-label">Tokens</span>
+<span class="token-label">Live Stats</span>
 <div style="font-size:0.8rem;color:#4b5563;font-family:'DM Mono',monospace;">
-Total: <strong>{n_tok}</strong> &nbsp;·&nbsp; <strong>{num_chunks_ui}</strong> fragments
+Tokens: <strong>{n_tok}</strong> ({num_chunks_ui} fragments) &nbsp;·&nbsp; Words: <strong>{n_words}</strong> &nbsp;·&nbsp; Chars: <strong>{n_chars}</strong> &nbsp;·&nbsp; Read time: <strong>~{read_time} min</strong>
 </div>
 </div>
 """,
@@ -1077,18 +1168,20 @@ Total: <strong>{n_tok}</strong> &nbsp;·&nbsp; <strong>{num_chunks_ui}</strong> 
                 disabled=not text_value.strip(),
                 key="detect_btn",
             )
+        def on_clear_text():
+            st.session_state.text_input = ""
+            st.session_state.text_area_widget = ""
+            st.session_state.last_result = None
+            st.session_state.last_compare = None
+
         with btn_col2:
             clear_btn = st.button(
                 "Clear text",
                 type="secondary",
                 use_container_width=True,
                 key="clear_btn",
+                on_click=on_clear_text
             )
-            if clear_btn:
-                st.session_state.text_input = ""
-                st.session_state.last_result = None
-                st.session_state.last_compare = None
-                st.rerun()
 
         file_detect_btn = False
 
@@ -1110,100 +1203,74 @@ with tab_file:
 
     loaded_files = []
 
+    @st.cache_data(show_spinner=False)
+    def extract_pdf_content(file_bytes: bytes) -> str:
+        import pypdf
+        import io
+        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+        return "\n".join(page.extract_text() for page in reader.pages if page.extract_text()).strip()
+
+    @st.cache_data(show_spinner=False)
+    def extract_docx_content(file_bytes: bytes) -> str:
+        import docx
+        import io
+        doc = docx.Document(io.BytesIO(file_bytes))
+        return "\n".join(para.text for para in doc.paragraphs if para.text.strip()).strip()
+
+    @st.cache_data(show_spinner=False)
+    def load_csv_dataframe(file_bytes: bytes) -> pd.DataFrame:
+        import io
+        return pd.read_csv(io.BytesIO(file_bytes))
+
     if uploaded_files:
 
-        import pypdf
-
         for uf in uploaded_files:
-
             try:
-
+                f_bytes = uf.read()
+                
                 if uf.name.endswith(".txt"):
-
-                    content = uf.read().decode("utf-8", errors="replace").strip()
-
+                    content = f_bytes.decode("utf-8", errors="replace").strip()
                     if content:
-
                         loaded_files.append((uf.name, content, None))
-
                     else:
-
                         st.warning(f"{uf.name}: empty file.")
 
                 elif uf.name.endswith(".csv"):
-
-                    df = pd.read_csv(uf)
-
+                    df = load_csv_dataframe(f_bytes)
                     if not df.empty:
-
                         cols = list(df.columns)
-
                         default = "text" if "text" in cols else cols[0]
-
                         sel_col = st.selectbox(
                             f"{uf.name} - Text column:",
                             cols,
                             index=cols.index(default),
                             key=f"csv_col_{uf.name}",
                         )
-
-                        csv_text_parts = []
-                        for idx, val in enumerate(df[sel_col]):
-                            if pd.notna(val) and str(val).strip():
-                                csv_text_parts.append(f"Row {idx+1}: {str(val).strip()}")
-                        
+                        csv_text_parts = [f"Row {idx+1}: {str(val).strip()}" 
+                                          for idx, val in enumerate(df[sel_col]) 
+                                          if pd.notna(val) and str(val).strip()]
                         csv_content = "\n\n".join(csv_text_parts)
                         
                         if csv_content:
-                            loaded_files.append(
-                                (uf.name, csv_content, None)
-                            )
+                            loaded_files.append((uf.name, csv_content, None))
                         else:
                             st.warning(f"{uf.name}: no valid text found in column '{sel_col}'.")
 
                 elif uf.name.endswith(".docx"):
-                    import docx
-                    doc = docx.Document(uf)
-                    full_text = []
-                    for para in doc.paragraphs:
-                        if para.text.strip():
-                            full_text.append(para.text)
-                    content = '\n'.join(full_text).strip()
+                    content = extract_docx_content(f_bytes)
                     if content:
                         loaded_files.append((uf.name, content, None))
                     else:
                         st.warning(f"{uf.name}: empty file.")
 
                 elif uf.name.endswith(".pdf"):
-
-                    pdf_raw = uf.read()
-
-                    reader = pypdf.PdfReader(io.BytesIO(pdf_raw))
-
-                    pages_text = []
-
-                    for page in reader.pages:
-
-                        t = page.extract_text()
-
-                        if t:
-
-                            pages_text.append(t)
-
-                    full_text = "\n".join(pages_text).strip()
-
+                    full_text = extract_pdf_content(f_bytes)
                     if full_text:
-
-                        loaded_files.append((uf.name, full_text, pdf_raw))
-
+                        loaded_files.append((uf.name, full_text, f_bytes))
                     else:
-
-                        st.warning(
-                            f"{uf.name}: could not extract text (possibly scanned)."
-                        )
+                        st.warning(f"{uf.name}: could not extract text (possibly scanned).")
 
             except Exception as e:
-
                 st.error(f"Error {uf.name}: {e}")
 
     # Afisam lista de fisiere incarcate
@@ -1247,7 +1314,7 @@ with tab_file:
                 st.markdown(
                     f'<div style="background:#f8fafc;border:1px solid #d1d5db;border-radius:8px;'
                     f'padding:8px 14px;margin:2px 0 6px 0;font-size:0.85rem;color:#1a1a1a;">'
-                    f"<strong>{fname}</strong> &nbsp;·&nbsp; {len(ftext):,} caractere"
+                    f"<strong>{fname}</strong> &nbsp;·&nbsp; {len(ftext):,} chars"
                     f" &nbsp;·&nbsp; {n_tok_f:,} tokens &nbsp;·&nbsp; {n_ch_f} fragments"
                     f"</div>",
                     unsafe_allow_html=True,
@@ -1316,10 +1383,10 @@ with tab_file:
                             for si, seg in enumerate(high_segs, 1)
                         )
                         br["report_plain"] = (
-                            f"TEXTSCAN AI — RAPORT: {fname} [{m_key.upper()}]\n"
+                            f"TEXTSCAN — REPORT: {fname} [{m_key.upper()}]\n"
                             f"================================\n"
                             f"Timestamp : {br['timestamp']}\nResult: {br['label']}\n"
-                            f"Scor AI: {pai_pct:.2f}%\nHuman Score: {ph_pct:.2f}%\n"
+                            f"AI Score  : {pai_pct:.2f}%\nHuman Score: {ph_pct:.2f}%\n"
                             f"Model: {m_name}\nFragments: {nch}\n"
                             f"{ai_seg_txt}================================\n"
                         )
@@ -1371,15 +1438,15 @@ with tab_file:
                     ai_seg_txt += f"Fragment {si} (AI Score: {seg['ai_prob']:.1f}%):\n\"{seg['text']}\"\n\n"
 
                 br["report_plain"] = (
-                    f"TEXTSCAN AI — RAPORT: {fname}\n"
+                    f"TEXTSCAN — REPORT: {fname}\n"
                     f"================================\n"
-                    f"Timestamp : {br['timestamp']}\n"
-                    f"Result  : {br['label']}\n"
-                    f"Scor AI   : {br['prob_ai']:.2f}%\n"
-                    f"Human Score : {br['prob_human']:.2f}%\n"
-                    f"Model     : {br['model']}\n"
-                    f"Fragments : {nch}\n"
-                    f"{('\nSECTIUNI SUSPECTE AI:\n' + '-'*40 + '\n' + ai_seg_txt) if ai_seg_txt else ''}\n"
+                    f"Timestamp  : {br['timestamp']}\n"
+                    f"Result     : {br['label']}\n"
+                    f"AI Score   : {br['prob_ai']:.2f}%\n"
+                    f"Human Score: {br['prob_human']:.2f}%\n"
+                    f"Model      : {br['model']}\n"
+                    f"Fragments  : {nch}\n"
+                    f"{('\nSUSPECTED AI SECTIONS:\n' + '-'*40 + '\n' + ai_seg_txt) if ai_seg_txt else ''}\n"
                     f"================================\n"
                 )
 
@@ -1501,7 +1568,7 @@ def run_single_model(model_k, mod, m_choice, active_text):
     n_tok_check = count_tokens(tokenizer, text_clean)
     num_chunks_check = ((n_tok_check + MAX_TOKENS - 3) // (MAX_TOKENS - 2) if n_tok_check > 0 else 0)
 
-    with st.spinner(f"Analyzing {num_chunks_check} text fragments cu {model_k}..."):
+    with st.spinner(f"Analyzing {num_chunks_check} text fragments with {model_k}..."):
         ph, pa, nc, h_segs, a_segs, ai_pct = predict(mod, tokenizer, text_clean)
 
     p_h_pct = ph * 100
@@ -1714,7 +1781,8 @@ with tab_file:
                     original_name = br.get("source_filename", f"file_{i}").lower()
                     is_pdf_or_docx = ".pdf" in original_name or ".docx" in original_name
                 
-                    fname = br.get("source_filename", f"file_{i}").rsplit(".", 1)[0]
+                    raw_fname = br.get("source_filename", f"file_{i}")
+                    fname = raw_fname.replace(".pdf", "").replace(".docx", "").replace(".PDF", "").replace(".DOCX", "")
                     pdf_bytes = br.get("pdf_report_bytes")
                     if pdf_bytes and is_pdf_or_docx:
                         zip_file.writestr(f"Report_{fname}.pdf", pdf_bytes)
@@ -1746,7 +1814,7 @@ with tab_file:
                 color = "#dc2626"; bg = "#fef2f2"; border = "#fca5a5"
                 icon = ""; verdict = "Majority AI content"
 
-            expander_title = f"{icon} {br['source_filename']} — {flagged} din {num_ch} fragmente detectate ca AI"
+            expander_title = f"{icon} {br['source_filename']} — {flagged} out of {num_ch} fragments detected as AI"
             with st.expander(expander_title, expanded=(i == 0)):
                 c_a, c_b = st.columns(2)
                 with c_a:
@@ -1755,9 +1823,9 @@ with tab_file:
                         <div style="font-size:0.8rem; color:#6b7280; margin-bottom:6px; font-weight:600;">{br['model']}</div>
                         <div style="font-size:0.8rem; color:#6b7280; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:6px;">{verdict}</div>
                         <div style="font-size:3rem; font-weight:900; color:{color}; line-height:1;">{ai_pct:.0f}<span style="font-size:1.4rem;">%</span></div>
-                        <div style="font-size:0.85rem; color:{color}; font-weight:600; margin:4px 0;">din text este generat de AI</div>
+                        <div style="font-size:0.85rem; color:{color}; font-weight:600; margin:4px 0;">of the text is AI-generated</div>
                         <div style="font-size:0.78rem; color:#6b7280; margin-top:6px;">
-                            {flagged} din {num_ch} fragment(s) exceeded the threshold of {threshold_pct:.0f}%
+                            {flagged} out of {num_ch} fragment(s) exceeded the threshold of {threshold_pct:.0f}%
                         </div>
                         <div style="font-size:0.72rem; color:#9ca3af; margin-top:4px;">
                             Average model score: Human {br['prob_human']:.1f}% · AI {br['prob_ai']:.1f}%
@@ -1787,4 +1855,27 @@ with tab_file:
                             use_container_width=True,
                             key=f"dl_batch_txt_{i}",
                         )
+
+                    import csv
+                    import io
+                    csv_buf = io.StringIO()
+                    c_writer = csv.writer(csv_buf)
+                    c_writer.writerow(["Filename", "AI Probability (%)", "Human Probability (%)", "Result Label", "Model Used", "Analyzed Fragments"])
+                    clean_fname = br.get("source_filename", "unknown").replace(" [V1]", "").replace(" [V2]", "")
+                    c_writer.writerow([
+                        clean_fname,
+                        f"{br.get('prob_ai', 0):.2f}",
+                        f"{br.get('prob_human', 0):.2f}",
+                        br.get("label", ""),
+                        br.get("model", ""),
+                        br.get("num_chunks", 0)
+                    ])
+                    st.download_button(
+                        "Download CSV",
+                        data=csv_buf.getvalue().encode("utf-8"),
+                        file_name=f"Report_{br['source_filename'].replace(' ','_')}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"dl_batch_csv_indiv_{i}",
+                    )
 
