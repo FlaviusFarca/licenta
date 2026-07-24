@@ -26,8 +26,13 @@ DEFAULT_THRESHOLD   = 0.5          # Default decision threshold (50%)
 DEFAULT_THRESHOLD_PCT = 50         # Default threshold as percentage
 MIN_WORDS_RECOMMENDED = 80         # Minimum recommended word count for reliable results
 BASE_DIR            = os.path.dirname(os.path.abspath(__file__))
-MODEL_V1_DIR        = os.path.join(BASE_DIR, "..", "roberta2")
-MODEL_V2_DIR        = os.path.join(BASE_DIR, "..", "roberta3")
+_v1_same            = os.path.join(BASE_DIR, "roberta2")
+_v1_parent          = os.path.join(BASE_DIR, "..", "roberta2")
+MODEL_V1_DIR        = _v1_same if os.path.exists(_v1_same) else _v1_parent
+
+_v2_same            = os.path.join(BASE_DIR, "roberta3")
+_v2_parent          = os.path.join(BASE_DIR, "..", "roberta3")
+MODEL_V2_DIR        = _v2_same if os.path.exists(_v2_same) else _v2_parent
 DEVICE              = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
